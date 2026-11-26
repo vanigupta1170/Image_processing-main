@@ -1,12 +1,14 @@
-# server.py
+# server.py  (PRISMIFY backend - lightweight ONNX version, no PyTorch needed)
+import io
+import os
+
+import numpy as np
+import onnxruntime as ort
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import torch
-import numpy as np
 from PIL import Image
-import io
 from skimage.color import rgb2gray, lab2rgb
-from model import ColorNet
+
 from db import init_db
 from auth import auth_bp
 
@@ -15,15 +17,20 @@ CORS(app)
 app.register_blueprint(auth_bp)
 init_db()  # Create DB if not exists
 
-# Load model once
-model = ColorNet()
-checkpoint = torch.load("pretrained/checkpoint-trained.pth.tar", map_location="cpu")
-model.load_state_dict(checkpoint["state_dict"], strict=False)
-model.eval()
+# Load the ONNX model once (converted from checkpoint-trained.pth.tar)
+session = ort.InferenceSession("pretrained/colornet.onnx", providers=["CPUExecutionProvider"])
+
+
+def resize_channel(channel, width, height):
+    """Bilinear-resize one float channel to (width, height)."""
+    img = Image.fromarray(channel.astype(np.float32), mode="F")
+    return np.asarray(img.resize((width, height), Image.BILINEAR))
+
 
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "message": "PRISMIFY API is running"})
+
 
 @app.route("/colorize", methods=["POST"])
 def colorize_image():
@@ -31,41 +38,37 @@ def colorize_image():
         return jsonify({"message": "No image uploaded"}), 400
 
     image = Image.open(request.files["image"].stream).convert("RGB")
-    orig_w, orig_h = image.size
 
-    # Keep large uploads reasonable for a free CPU server
+    # Keep large uploads reasonable for a free server
     max_side = 1024
-    if max(orig_w, orig_h) > max_side:
-        scale = max_side / max(orig_w, orig_h)
-        image = image.resize((int(orig_w * scale), int(orig_h * scale)), Image.LANCZOS)
-        orig_w, orig_h = image.size
+    if max(image.size) > max_side:
+        scale = max_side / max(image.size)
+        image = image.resize((int(image.width * scale), int(image.height * scale)), Image.LANCZOS)
+    w, h = image.size
 
     # Full-resolution lightness channel (keeps all the detail)
     L_full = rgb2gray(np.asarray(image))
 
     # The model predicts colour at 224x224
     small = np.asarray(image.resize((224, 224), Image.LANCZOS))
-    L_small = torch.from_numpy(rgb2gray(small)).unsqueeze(0).unsqueeze(0).float()
-
-    with torch.no_grad():
-        output_ab = model(L_small)
+    L_small = rgb2gray(small).astype(np.float32)[None, None, :, :]
+    ab = session.run(None, {"L": L_small})[0][0]  # shape (2, 224, 224)
 
     # Scale the predicted colour back up to the original size
-    output_ab = torch.nn.functional.interpolate(
-        output_ab, size=(orig_h, orig_w), mode="bilinear", align_corners=False
-    )
-    output_ab = output_ab.squeeze(0).cpu().numpy().transpose((1, 2, 0))
+    a = resize_channel(ab[0], w, h)
+    b = resize_channel(ab[1], w, h)
 
-    lab_output = np.zeros((orig_h, orig_w, 3))
-    lab_output[:, :, 0] = L_full * 100
-    lab_output[:, :, 1:] = output_ab * 255 - 128
-    rgb_result = (np.clip(lab2rgb(lab_output), 0, 1) * 255).astype(np.uint8)
+    lab = np.zeros((h, w, 3))
+    lab[:, :, 0] = L_full * 100
+    lab[:, :, 1] = a * 255 - 128
+    lab[:, :, 2] = b * 255 - 128
+    rgb = (np.clip(lab2rgb(lab), 0, 1) * 255).astype(np.uint8)
 
-    img_bytes = io.BytesIO()
-    Image.fromarray(rgb_result).save(img_bytes, format="PNG")
-    img_bytes.seek(0)
-    return send_file(img_bytes, mimetype="image/png")
+    buf = io.BytesIO()
+    Image.fromarray(rgb).save(buf, format="PNG")
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
 
 if __name__ == "__main__":
-    import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

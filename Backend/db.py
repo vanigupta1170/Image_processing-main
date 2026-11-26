@@ -12,7 +12,7 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
 
-    # Create fresh table with correct schema
+    # Create the table only if it doesn't exist (keeps existing users)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
