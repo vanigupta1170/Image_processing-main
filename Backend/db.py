@@ -12,9 +12,6 @@ def init_db():
     conn = get_db()
     cursor = conn.cursor()
 
-    # Drop old invalid table (to fix the 'no password column' issue)
-    cursor.execute("DROP TABLE IF EXISTS users")
-
     # Create fresh table with correct schema
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
